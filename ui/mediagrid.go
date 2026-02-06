@@ -5,19 +5,16 @@ import (
 	"context"
 	"fmt"
 	"image"
-	"image/color"
 	_ "image/jpeg"
 	_ "image/png"
 	"log"
 	"os"
 	"sync"
-	"time"
 
 	"fyne.io/fyne/v2"
 	"fyne.io/fyne/v2/canvas"
 	"fyne.io/fyne/v2/container"
 	"fyne.io/fyne/v2/data/binding"
-	"fyne.io/fyne/v2/layout"
 	"fyne.io/fyne/v2/theme"
 	"fyne.io/fyne/v2/widget"
 
@@ -31,57 +28,39 @@ type MediaItem struct {
 	Index        int
 }
 
-// MediaGrid displays media as a grid of poster images
+// MediaGrid displays media as a grid using Fyne's GridWrap widget
 type MediaGrid struct {
 	widget.BaseWidget
 	tree         *tree.Tree
 	window       fyne.Window
-	cols         int
-	rowHeight    float32
-	colWidth     float32
 	items        []*MediaItem
-	visibleStart int
-	visibleEnd   int
-	batchSize    int
-	container    *fyne.Container
-	scrollBar    *container.Scroll
-	visibleCards []fyne.CanvasObject // Cache rendered cards
+	gridWrap     *widget.GridWrap
 	imageCache   map[string]fyne.Resource
 	imageCacheMu sync.RWMutex
-	selectedIdx  int
 	loadCtx      context.Context
 	loadCancel   context.CancelFunc
 	pendingLoads sync.WaitGroup
-	renderCtx    context.Context
-	renderCancel context.CancelFunc
-	isRendering  bool
-	renderMu     sync.Mutex
 	onRefresh    func()
 	progressBar  *widget.ProgressBarInfinite
 	statusLabel  *widget.Label
 	mainContent  *fyne.Container
+	cols         int
 }
 
 // NewMediaGrid creates a new media grid widget
 func NewMediaGrid(t *tree.Tree, cols int, win fyne.Window) *MediaGrid {
 	ctx, cancel := context.WithCancel(context.Background())
-	renderCtx, renderCancel := context.WithCancel(context.Background())
 
 	g := &MediaGrid{
-		tree:         t,
-		window:       win,
-		cols:         cols,
-		rowHeight:    200,
-		colWidth:     150,
-		batchSize:    50, // Render in smaller batches
-		items:        make([]*MediaItem, 0),
-		imageCache:   make(map[string]fyne.Resource),
-		loadCtx:      ctx,
-		loadCancel:   cancel,
-		renderCtx:    renderCtx,
-		renderCancel: renderCancel,
-		progressBar:  widget.NewProgressBarInfinite(),
-		statusLabel:  widget.NewLabel("Loading media library..."),
+		tree:        t,
+		window:      win,
+		cols:        cols,
+		items:       make([]*MediaItem, 0),
+		imageCache:  make(map[string]fyne.Resource),
+		loadCtx:     ctx,
+		loadCancel:  cancel,
+		progressBar: widget.NewProgressBarInfinite(),
+		statusLabel: widget.NewLabel("Loading media library..."),
 	}
 
 	g.ExtendBaseWidget(g)
@@ -90,8 +69,6 @@ func NewMediaGrid(t *tree.Tree, cols int, win fyne.Window) *MediaGrid {
 
 // CreateRenderer creates the widget renderer
 func (g *MediaGrid) CreateRenderer() fyne.WidgetRenderer {
-	g.container = container.NewVBox()
-
 	// Create loading view
 	loadingView := container.NewVBox(
 		widget.NewLabel("Building media library..."),
@@ -119,23 +96,100 @@ func (g *MediaGrid) Refresh() {
 
 	g.progressBar.Stop()
 
-	// Cancel any ongoing progressive rendering
-	if g.renderCancel != nil {
-		g.renderCancel()
-	}
-	g.renderCtx, g.renderCancel = context.WithCancel(context.Background())
-
-	// Build media items from virtual filesystem (tree in memory)
+	// Build media items from virtual filesystem
 	g.buildMediaItems()
 
-	// Render initial batch
-	g.renderVisibleBatch()
+	// Create or update GridWrap widget
+	if g.gridWrap == nil {
+		g.gridWrap = widget.NewGridWrap(
+			func() int {
+				return len(g.items)
+			},
+			func() fyne.CanvasObject {
+				// Create template
+				img := canvas.NewImageFromResource(theme.MediaVideoIcon())
+				img.FillMode = canvas.ImageFillContain
+				img.SetMinSize(fyne.NewSize(140, 190))
 
-	log.Printf("Rendered initial batch %d-%d of %d items",
-		g.visibleStart, g.visibleEnd, len(g.items))
+				label := widget.NewLabel("Template")
+				label.Wrapping = fyne.TextWrapWord
+				label.Alignment = fyne.TextAlignCenter
 
-	// Start progressive rendering in background
-	go g.progressiveRender()
+				card := container.NewBorder(nil, label, nil, nil, img)
+				return card
+			},
+			func(id widget.GridWrapItemID, obj fyne.CanvasObject) {
+				if id >= len(g.items) {
+					return
+				}
+
+				item := g.items[id]
+				card := obj.(*fyne.Container)
+
+				// Update image
+				if len(card.Objects) > 0 {
+					if img, ok := card.Objects[0].(*canvas.Image); ok {
+						// Set current resource
+						if val, err := item.ImageBinding.Get(); err == nil {
+							if resource, ok := val.(fyne.Resource); ok {
+								img.Resource = resource
+								img.Refresh()
+							}
+						}
+					}
+				}
+
+				// Update label (last object in border container)
+				if label, ok := card.Objects[len(card.Objects)-1].(*widget.Label); ok {
+					label.SetText(item.Node.Name)
+				}
+			},
+		)
+
+		// Handle selection
+		g.gridWrap.OnSelected = func(id widget.GridWrapItemID) {
+			if id >= len(g.items) {
+				return
+			}
+
+			item := g.items[id]
+			g.tree.SelectedIdx = int(id)
+
+			if item.Node.IsDir {
+				g.tree.Enter()
+				g.Refresh()
+				if g.onRefresh != nil {
+					g.onRefresh()
+				}
+			} else {
+				log.Printf("Selected: %s", item.Node.Path)
+			}
+		}
+	}
+
+	// Update GridWrap data
+	g.gridWrap.Refresh()
+
+	// Select current item
+	if g.tree.SelectedIdx >= 0 && g.tree.SelectedIdx < len(g.items) {
+		g.gridWrap.Select(widget.GridWrapItemID(g.tree.SelectedIdx))
+		g.gridWrap.ScrollTo(widget.GridWrapItemID(g.tree.SelectedIdx))
+	}
+
+	// Update main content
+	pathLabel := widget.NewLabel("📁 " + g.tree.CurrentDir.Path)
+	pathLabel.Wrapping = fyne.TextWrapWord
+
+	content := container.NewBorder(
+		pathLabel,
+		nil, nil, nil,
+		g.gridWrap,
+	)
+
+	g.mainContent.Objects = []fyne.CanvasObject{content}
+	g.mainContent.Refresh()
+
+	log.Printf("Rendered grid with %d items", len(g.items))
 }
 
 // buildMediaItems creates MediaItem wrappers for visible nodes
@@ -222,395 +276,71 @@ func (g *MediaGrid) loadImageAsync(posterPath string, item *MediaItem) {
 
 	// Update binding (this triggers UI update automatically)
 	item.ImageBinding.Set(resource)
-}
 
-// renderVisibleBatch renders items in the current window
-func (g *MediaGrid) renderVisibleBatch() {
-	g.container.Objects = nil
-
-	// Add path header
-	pathLabel := widget.NewLabel("📁 " + g.tree.CurrentDir.Path)
-	pathLabel.Wrapping = fyne.TextWrapWord
-	g.container.Add(pathLabel)
-
-	// Calculate visible range
-	totalItems := len(g.items)
-	g.visibleStart = 0
-	g.visibleEnd = totalItems
-	if totalItems > g.batchSize {
-		g.visibleEnd = g.batchSize
-
-		infoLabel := widget.NewLabel(
-			fmt.Sprintf("Showing %d-%d of %d items (scroll for more)",
-				g.visibleStart+1, g.visibleEnd, totalItems))
-		g.container.Add(infoLabel)
-	}
-
-	// Create grid container for media items
-	gridContainer := container.New(layout.NewGridWrapLayout(fyne.NewSize(g.colWidth, g.rowHeight)))
-
-	// Add visible items
-	visibleCards := make([]fyne.CanvasObject, 0)
-	for i := g.visibleStart; i < g.visibleEnd && i < len(g.items); i++ {
-		item := g.items[i]
-		mediaCard := g.createMediaCard(item)
-		gridContainer.Add(mediaCard)
-		visibleCards = append(visibleCards, mediaCard)
-	}
-	g.visibleCards = visibleCards
-
-	g.container.Add(gridContainer)
-
-	// Update main content with scroll container
-	if g.scrollBar == nil {
-		g.scrollBar = container.NewVScroll(g.container)
-		g.mainContent.Objects = []fyne.CanvasObject{g.scrollBar}
-	} else {
-		g.scrollBar.Content = g.container
-		g.scrollBar.Refresh()
-	}
-	g.mainContent.Refresh()
-}
-
-// createMediaCard creates a card for a media item with data-bound image
-func (g *MediaGrid) createMediaCard(item *MediaItem) fyne.CanvasObject {
-	// Create image canvas
-	img := canvas.NewImageFromResource(theme.MediaVideoIcon())
-	img.FillMode = canvas.ImageFillContain
-	img.SetMinSize(fyne.NewSize(g.colWidth-10, g.rowHeight-40))
-
-	// Bind image to data binding
-	item.ImageBinding.AddListener(binding.NewDataListener(func() {
-		if val, err := item.ImageBinding.Get(); err == nil {
-			if resource, ok := val.(fyne.Resource); ok {
-				img.Resource = resource
-				img.Refresh()
-			}
-		}
-	}))
-
-	// Initial value
-	if val, err := item.ImageBinding.Get(); err == nil {
-		if resource, ok := val.(fyne.Resource); ok {
-			img.Resource = resource
-		}
-	}
-
-	// Create label
-	label := widget.NewLabel(item.Node.Name)
-	label.Wrapping = fyne.TextWrapWord
-	label.Alignment = fyne.TextAlignCenter
-
-	// Create card container
-	card := container.NewBorder(
-		nil,
-		label,
-		nil,
-		nil,
-		img,
-	)
-
-	// Make it tappable
-	tappable := newTappableContainer(card, func() {
-		g.onItemTapped(item)
-	})
-
-	// Highlight if selected
-	if item.Index == g.tree.SelectedIdx {
-		tappable.(*tappableContainer).selected = true
-	}
-
-	return tappable
-}
-
-// progressiveRender renders remaining items in batches asynchronously
-func (g *MediaGrid) progressiveRender() {
-	g.renderMu.Lock()
-	if g.isRendering {
-		g.renderMu.Unlock()
-		return
-	}
-	g.isRendering = true
-	g.renderMu.Unlock()
-
-	defer func() {
-		g.renderMu.Lock()
-		g.isRendering = false
-		g.renderMu.Unlock()
-	}()
-
-	totalItems := len(g.items)
-	if g.visibleEnd >= totalItems {
-		return
-	}
-
-	// Get the grid container
-	var gridContainer *fyne.Container
-	if len(g.container.Objects) > 0 {
-		if c, ok := g.container.Objects[len(g.container.Objects)-1].(*fyne.Container); ok {
-			gridContainer = c
-		}
-	}
-
-	if gridContainer == nil {
-		return
-	}
-
-	// Render remaining items in batches with small delays
-	for g.visibleEnd < totalItems {
-		// Check if cancelled
-		select {
-		case <-g.renderCtx.Done():
-			return
-		default:
-		}
-
-		// Calculate next batch
-		batchStart := g.visibleEnd
-		batchEnd := min(batchStart+g.batchSize, totalItems)
-
-		// Update visible end immediately (before async UI update)
-		g.visibleEnd = batchEnd
-
-		// Batch all UI operations together
+	// Refresh the grid item to show the new image (must be on UI thread)
+	if g.gridWrap != nil {
+		itemID := widget.GridWrapItemID(item.Index)
 		fyne.Do(func() {
-			// Add batch items
-			for i := batchStart; i < batchEnd; i++ {
-				item := g.items[i]
-				mediaCard := g.createMediaCard(item)
-				gridContainer.Add(mediaCard)
-				g.visibleCards = append(g.visibleCards, mediaCard)
-			}
-
-			// Update info label
-			if len(g.container.Objects) >= 2 {
-				if label, ok := g.container.Objects[1].(*widget.Label); ok {
-					if batchEnd < totalItems {
-						label.SetText(fmt.Sprintf("Showing %d-%d of %d items (loading...)",
-							g.visibleStart+1, batchEnd, totalItems))
-					} else {
-						label.SetText(fmt.Sprintf("Showing all %d items", totalItems))
-					}
-				}
-			}
-
-			// Refresh grid
-			gridContainer.Refresh()
-			g.scrollBar.Content.Refresh()
+			g.gridWrap.RefreshItem(itemID)
 		})
-
-		log.Printf("Progressive render: added batch %d-%d (total: %d)", batchStart, batchEnd, totalItems)
-
-		// Small delay to avoid overwhelming UI thread
-		if batchEnd < totalItems {
-			timer := time.NewTimer(100 * time.Millisecond)
-			select {
-			case <-g.renderCtx.Done():
-				timer.Stop()
-				return
-			case <-timer.C:
-				// Continue to next batch
-			}
-		}
-	}
-}
-
-// updateSelection updates only the selection highlight without rebuilding the grid
-func (g *MediaGrid) updateSelection(oldIdx, newIdx int) {
-	// Update within visible range
-	if oldIdx >= g.visibleStart && oldIdx < g.visibleEnd {
-		cardIdx := oldIdx - g.visibleStart
-		if cardIdx >= 0 && cardIdx < len(g.visibleCards) {
-			if card, ok := g.visibleCards[cardIdx].(*tappableContainer); ok {
-				card.selected = false
-				card.Refresh()
-			}
-		}
-	}
-
-	if newIdx >= g.visibleStart && newIdx < g.visibleEnd {
-		cardIdx := newIdx - g.visibleStart
-		if cardIdx >= 0 && cardIdx < len(g.visibleCards) {
-			if card, ok := g.visibleCards[cardIdx].(*tappableContainer); ok {
-				card.selected = true
-				card.Refresh()
-			}
-		}
-	}
-
-	// Scroll to keep selected item visible (items will render progressively)
-	g.scrollToSelection(newIdx)
-}
-
-// scrollToSelection ensures the selected item is visible in the scroll view
-func (g *MediaGrid) scrollToSelection(idx int) {
-	if g.scrollBar == nil || idx < 0 || idx >= len(g.items) {
-		return
-	}
-
-	// Only scroll if item is actually rendered
-	if idx >= g.visibleEnd {
-		return // Item not rendered yet
-	}
-
-	// Calculate the actual rendered position based on visible cards
-	cardIdx := idx - g.visibleStart
-	if cardIdx < 0 || cardIdx >= len(g.visibleCards) {
-		return
-	}
-
-	// Calculate position based on rendered rows
-	row := idx / g.cols
-	rowY := float32(row) * g.rowHeight
-
-	if g.scrollBar.Content == nil {
-		return
-	}
-
-	viewHeight := g.scrollBar.Size().Height
-	currentOffset := g.scrollBar.Offset.Y
-
-	// Define visible region with padding
-	topThreshold := currentOffset + 50                               // 50px from top
-	bottomThreshold := currentOffset + viewHeight - g.rowHeight - 50 // 50px from bottom
-
-	// Check if item is outside comfortable viewing area
-	needsScroll := false
-	var newOffset float32
-
-	if rowY < topThreshold {
-		// Item is too close to top or above - center it in upper portion
-		newOffset = rowY - g.rowHeight
-		if newOffset < 0 {
-			newOffset = 0
-		}
-		needsScroll = true
-	} else if rowY > bottomThreshold {
-		// Item is too close to bottom or below - center it in lower portion
-		newOffset = rowY - viewHeight + g.rowHeight*2
-		if newOffset < 0 {
-			newOffset = 0
-		}
-		needsScroll = true
-	}
-
-	if needsScroll {
-		g.scrollBar.ScrollToOffset(fyne.NewPos(0, newOffset))
-	}
-}
-
-// tappableContainer wraps a container to make it tappable
-type tappableContainer struct {
-	widget.BaseWidget
-	content  fyne.CanvasObject
-	onTapped func()
-	selected bool
-}
-
-func newTappableContainer(content fyne.CanvasObject, onTapped func()) fyne.CanvasObject {
-	t := &tappableContainer{
-		content:  content,
-		onTapped: onTapped,
-	}
-	t.ExtendBaseWidget(t)
-	return t
-}
-
-func (t *tappableContainer) CreateRenderer() fyne.WidgetRenderer {
-	bg := canvas.NewRectangle(color.Transparent)
-	if t.selected {
-		bg.FillColor = theme.Color(theme.ColorNamePrimary)
-		bg.CornerRadius = 4
-	}
-
-	return &tappableRenderer{
-		container: t,
-		bg:        bg,
-		objects:   []fyne.CanvasObject{bg, t.content},
-	}
-}
-
-func (t *tappableContainer) Tapped(*fyne.PointEvent) {
-	if t.onTapped != nil {
-		t.onTapped()
-	}
-}
-
-type tappableRenderer struct {
-	container *tappableContainer
-	bg        *canvas.Rectangle
-	objects   []fyne.CanvasObject
-}
-
-func (r *tappableRenderer) Layout(size fyne.Size) {
-	r.bg.Resize(size)
-	r.container.content.Resize(size)
-}
-
-func (r *tappableRenderer) MinSize() fyne.Size {
-	return r.container.content.MinSize()
-}
-
-func (r *tappableRenderer) Refresh() {
-	if r.container.selected {
-		r.bg.FillColor = theme.Color(theme.ColorNamePrimary)
-	} else {
-		r.bg.FillColor = color.Transparent
-	}
-	r.bg.Refresh()
-	canvas.Refresh(r.container.content)
-}
-
-func (r *tappableRenderer) Objects() []fyne.CanvasObject {
-	return r.objects
-}
-
-func (r *tappableRenderer) Destroy() {}
-
-// onItemTapped handles item selection and navigation
-func (g *MediaGrid) onItemTapped(item *MediaItem) {
-	g.tree.SelectedIdx = item.Index
-
-	if item.Node.IsDir {
-		// Navigate into directory (using virtual filesystem)
-		g.tree.Enter()
-		g.Refresh()
-		if g.onRefresh != nil {
-			g.onRefresh()
-		}
-	} else {
-		log.Printf("Selected: %s", item.Node.Path)
 	}
 }
 
 // TypedKey handles keyboard navigation
 func (g *MediaGrid) TypedKey(key *fyne.KeyEvent) {
-	oldIdx := g.tree.SelectedIdx
+	if g.gridWrap == nil || len(g.items) == 0 {
+		return
+	}
+
+	currentID := widget.GridWrapItemID(g.tree.SelectedIdx)
+	var newID widget.GridWrapItemID
+
+	// Get actual column count from GridWrap
+	cols := g.gridWrap.ColumnCount()
 
 	switch key.Name {
 	case fyne.KeyUp:
-		g.tree.NavigateUp(g.cols)
+		if currentID >= cols {
+			newID = currentID - cols
+		} else {
+			return
+		}
 	case fyne.KeyDown:
-		g.tree.NavigateDown(g.cols)
+		if currentID+cols < len(g.items) {
+			newID = currentID + cols
+		} else {
+			return
+		}
 	case fyne.KeyLeft:
-		g.tree.NavigateLeft()
+		if currentID > 0 {
+			newID = currentID - 1
+		} else {
+			return
+		}
 	case fyne.KeyRight:
-		g.tree.NavigateRight()
+		if currentID < len(g.items)-1 {
+			newID = currentID + 1
+		} else {
+			return
+		}
 	case fyne.KeyReturn, fyne.KeyEnter:
-		if g.tree.SelectedIdx >= 0 && g.tree.SelectedIdx < len(g.items) {
-			g.onItemTapped(g.items[g.tree.SelectedIdx])
+		// Trigger selection
+		if g.gridWrap.OnSelected != nil && currentID < len(g.items) {
+			g.gridWrap.OnSelected(currentID)
 		}
 		return
 	case fyne.KeyBackspace:
 		g.tree.GoUp()
 		g.Refresh()
 		return
+	default:
+		return
 	}
 
-	// Update selection visually if changed
-	if oldIdx != g.tree.SelectedIdx {
-		g.updateSelection(oldIdx, g.tree.SelectedIdx)
-	}
+	// Update selection
+	g.tree.SelectedIdx = int(newID)
+	g.gridWrap.Select(newID)
+	g.gridWrap.ScrollTo(newID)
 }
 
 // TypedRune implements Focusable
